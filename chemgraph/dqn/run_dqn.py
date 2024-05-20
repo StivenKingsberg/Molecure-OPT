@@ -23,13 +23,13 @@ import functools
 import json
 import os
 import time
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from absl import app
 from absl import flags
 from absl import logging
 from baselines.common import schedules
 from baselines.deepq import replay_buffer
-
+import logging 
 import numpy as np
 
 from rdkit import Chem
@@ -349,80 +349,143 @@ def _step(environment, dqn, memory, episode, hparams, exploration, head):
   return result
 
 
-def run_dqn(multi_objective=False):
-  """Run the training of Deep Q Network algorithm.
+def a3c_worker(worker_id, global_model, optimizer, multi_objective):
+    """Worker function to train A3C algorithm."""
+    if FLAGS.hparams is not None:
+        with gfile.Open(FLAGS.hparams, 'r') as f:
+            hparams = deep_q_networks.get_hparams(**json.load(f))
+    else:
+        hparams = deep_q_networks.get_hparams()
+    
+    logging.info(
+        'Worker %d HParams:\n%s', worker_id, '\n'.join([
+            '\t%s: %s' % (key, value)
+            for key, value in sorted(hparams.values().items())
+        ]))
 
-  Args:
-    multi_objective: Boolean. Whether to run the multiobjective DQN.
-  """
-  if FLAGS.hparams is not None:
-    with gfile.Open(FLAGS.hparams, 'r') as f:
-      hparams = deep_q_networks.get_hparams(**json.load(f))
-  else:
-    hparams = deep_q_networks.get_hparams()
-  logging.info(
-      'HParams:\n%s', '\n'.join([
-          '\t%s: %s' % (key, value)
-          for key, value in sorted(hparams.values().items())
-      ]))
+    if multi_objective:
+        environment = MultiObjectiveRewardMolecule(
+            target_molecule=FLAGS.target_molecule,
+            atom_types=set(hparams.atom_types),
+            init_mol=FLAGS.start_molecule,
+            allow_removal=hparams.allow_removal,
+            allow_no_modification=hparams.allow_no_modification,
+            allow_bonds_between_rings=False,
+            allowed_ring_sizes={3, 4, 5, 6},
+            max_steps=hparams.max_steps_per_episode)
 
-  # TODO(zzp): merge single objective DQN to multi objective DQN.
-  if multi_objective:
-    environment = MultiObjectiveRewardMolecule(
-        target_molecule=FLAGS.target_molecule,
-        atom_types=set(hparams.atom_types),
-        init_mol=FLAGS.start_molecule,
-        allow_removal=hparams.allow_removal,
-        allow_no_modification=hparams.allow_no_modification,
-        allow_bonds_between_rings=False,
-        allowed_ring_sizes={3, 4, 5, 6},
-        max_steps=hparams.max_steps_per_episode)
+        worker_model = deep_q_networks.MultiObjectiveDeepQNetwork(
+            objective_weight=np.array([[FLAGS.similarity_weight],
+                                       [1 - FLAGS.similarity_weight]]),
+            input_shape=(hparams.batch_size, hparams.fingerprint_length + 1),
+            q_fn=functools.partial(
+                deep_q_networks.multi_layer_model, hparams=hparams),
+            optimizer=hparams.optimizer,
+            grad_clipping=hparams.grad_clipping,
+            num_bootstrap_heads=hparams.num_bootstrap_heads,
+            gamma=hparams.gamma,
+            epsilon=1.0)
+    else:
+        environment = TargetWeightMolecule(
+            target_weight=FLAGS.target_weight,
+            atom_types=set(hparams.atom_types),
+            init_mol=FLAGS.start_molecule,
+            allow_removal=hparams.allow_removal,
+            allow_no_modification=hparams.allow_no_modification,
+            allow_bonds_between_rings=hparams.allow_bonds_between_rings,
+            allowed_ring_sizes=set(hparams.allowed_ring_sizes),
+            max_steps=hparams.max_steps_per_episode)
 
-    dqn = deep_q_networks.MultiObjectiveDeepQNetwork(
-        objective_weight=np.array([[FLAGS.similarity_weight],
-                                   [1 - FLAGS.similarity_weight]]),
-        input_shape=(hparams.batch_size, hparams.fingerprint_length + 1),
-        q_fn=functools.partial(
-            deep_q_networks.multi_layer_model, hparams=hparams),
-        optimizer=hparams.optimizer,
-        grad_clipping=hparams.grad_clipping,
-        num_bootstrap_heads=hparams.num_bootstrap_heads,
-        gamma=hparams.gamma,
-        epsilon=1.0)
-  else:
-    environment = TargetWeightMolecule(
-        target_weight=FLAGS.target_weight,
-        atom_types=set(hparams.atom_types),
-        init_mol=FLAGS.start_molecule,
-        allow_removal=hparams.allow_removal,
-        allow_no_modification=hparams.allow_no_modification,
-        allow_bonds_between_rings=hparams.allow_bonds_between_rings,
-        allowed_ring_sizes=set(hparams.allowed_ring_sizes),
-        max_steps=hparams.max_steps_per_episode)
+        worker_model = deep_q_networks.DeepQNetwork(
+            input_shape=(hparams.batch_size, hparams.fingerprint_length + 1),
+            q_fn=functools.partial(
+                deep_q_networks.multi_layer_model, hparams=hparams),
+            optimizer=hparams.optimizer,
+            grad_clipping=hparams.grad_clipping,
+            num_bootstrap_heads=hparams.num_bootstrap_heads,
+            gamma=hparams.gamma,
+            epsilon=1.0)
 
-    dqn = deep_q_networks.DeepQNetwork(
-        input_shape=(hparams.batch_size, hparams.fingerprint_length + 1),
-        q_fn=functools.partial(
-            deep_q_networks.multi_layer_model, hparams=hparams),
-        optimizer=hparams.optimizer,
-        grad_clipping=hparams.grad_clipping,
-        num_bootstrap_heads=hparams.num_bootstrap_heads,
-        gamma=hparams.gamma,
-        epsilon=1.0)
+    while True:  # Add your own stopping criterion
+        states = []
+        actions = []
+        rewards = []
+        next_states = []
+        dones = []
 
-  run_training(
-      hparams=hparams,
-      environment=environment,
-      dqn=dqn,
-  )
+        state = environment.reset()
+        for _ in range(hparams.max_steps_per_episode):
+            action = worker_model.select_action(state)
+            next_state, reward, done, _ = environment.step(action)
 
-  core.write_hparams(hparams, os.path.join(FLAGS.model_dir, 'config.json'))
+            states.append(state)
+            actions.append(action)
+            rewards.append(reward)
+            next_states.append(next_state)
+            dones.append(done)
 
+            state = next_state
+            if done:
+                break
+
+        with tf.GradientTape() as tape:
+            loss = worker_model.compute_loss(states, actions, rewards, next_states, dones)
+        grads = tape.gradient(loss, worker_model.trainable_weights)
+        optimizer.apply_gradients(zip(grads, global_model.trainable_weights))
+
+def run_a3c(multi_objective=False):
+    """Run the training of A3C algorithm."""
+    if FLAGS.hparams is not None:
+        with gfile.Open(FLAGS.hparams, 'r') as f:
+            hparams = deep_q_networks.get_hparams(**json.load(f))
+    else:
+        hparams = deep_q_networks.get_hparams()
+
+    logging.info(
+        'HParams:\n%s', '\n'.join([
+            '\t%s: %s' % (key, value)
+            for key, value in sorted(hparams.values().items())
+        ]))
+
+    if multi_objective:
+        global_model = deep_q_networks.MultiObjectiveDeepQNetwork(
+            objective_weight=np.array([[FLAGS.similarity_weight],
+                                       [1 - FLAGS.similarity_weight]]),
+            input_shape=(hparams.batch_size, hparams.fingerprint_length + 1),
+            q_fn=functools.partial(
+                deep_q_networks.multi_layer_model, hparams=hparams),
+            optimizer=hparams.optimizer,
+            grad_clipping=hparams.grad_clipping,
+            num_bootstrap_heads=hparams.num_bootstrap_heads,
+            gamma=hparams.gamma,
+            epsilon=1.0)
+    else:
+        global_model = deep_q_networks.DeepQNetwork(
+            input_shape=(hparams.batch_size, hparams.fingerprint_length + 1),
+            q_fn=functools.partial(
+                deep_q_networks.multi_layer_model, hparams=hparams),
+            optimizer=hparams.optimizer,
+            grad_clipping=hparams.grad_clipping,
+            num_bootstrap_heads=hparams.num_bootstrap_heads,
+            gamma=hparams.gamma,
+            epsilon=1.0)
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=hparams.learning_rate)
+
+    workers = []
+    for worker_id in range(3):  # Number of workers
+        worker = threading.Thread(target=a3c_worker, args=(worker_id, global_model, optimizer, multi_objective))
+        workers.append(worker)
+
+    for worker in workers:
+        worker.start()
+
+    for worker in workers:
+        worker.join()
 
 def main(argv):
-  del argv  # unused.
-  run_dqn(FLAGS.multi_objective)
-
+    del argv  # unused.
+    run_a3c(FLAGS.multi_objective)
 
 if __name__ == '__main__':
   app.run(main)
